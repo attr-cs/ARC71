@@ -4,6 +4,12 @@ const axios = require('axios');
 const { GoogleGenAI, createPartFromUri } = require('@google/genai');
 const { Buffer } = require('buffer');
 const sharp = require('sharp');
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('hello');
+});
 require('dotenv').config();
 
 // Initialize bot
@@ -920,3 +926,7 @@ bot.command('its', checkAuth, async (ctx) => {
 // Start bot
 bot.launch();
 console.log('Bot started as ARC71');
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Server running on port', process.env.PORT || 3000);
+});
