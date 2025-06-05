@@ -4,12 +4,6 @@ const axios = require('axios');
 const { GoogleGenAI, createPartFromUri } = require('@google/genai');
 const { Buffer } = require('buffer');
 const sharp = require('sharp');
-const express = require('express');
-const app = express();
-
-app.get('/', (req, res) => {
-  res.send('hello');
-});
 require('dotenv').config();
 
 // Initialize bot
@@ -35,7 +29,6 @@ const imageSchema = new mongoose.Schema({
   userId: String,
   username: String,
   prompt: String,
-  encodedImage: String,
   timestamp: { type: Date, default: Date.now },
 });
 const ImageSchema = mongoose.model('Image', imageSchema);
@@ -148,14 +141,13 @@ async function updateUserStats(userId, firstName, username, imageCount = 0, proc
   );
 }
 
-async function saveImagesToDb(userId, username, prompt, images) {
-  const imageDocs = images.map(img => ({
+async function saveImagesToDb(userId, username, prompt) {
+  const imageDoc = {
     userId,
     username,
     prompt,
-    encodedImage: img.encodedImage || img.imageBytes || img,
-  }));
-  await ImageSchema.insertMany(imageDocs);
+  };
+  await ImageSchema.create(imageDoc);
 }
 
 async function showWaitMessage(ctx) {
@@ -376,7 +368,7 @@ bot.command('block', checkAdmin, async (ctx) => {
           { value: users.join(',') },
           { upsert: true }
         );
-        await ctx.reply(`User ${userId} blocked.`);
+        await ctx.reply(`User ${userId} blocked silently.`);
       } else {
         await ctx.reply(`User ${userId} is already blocked.`);
       }
@@ -511,6 +503,7 @@ bot.command('cmds', async (ctx) => {
     ...(isAdmin ? [
       '/allow - Authorize user or group',
       '/block - Silently block user',
+      '/unblock - Unblock user',
       '/enable_dm - Allow DMs',
       '/disable_dm - Block DMs',
       '/set_token - Update image token',
@@ -580,7 +573,7 @@ bot.command(['i', 'I'], checkAuth, async (ctx) => {
 
     await ctx.replyWithMediaGroup(mediaGroup);
     await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, mediaGroup.length);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt, images);
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
     const errorMessage = error.response?.status === 401
       ? 'Authentication failed. Please update token with /set_token.'
@@ -661,7 +654,7 @@ bot.command('g', checkAuth, async (ctx) => {
 
     await ctx.replyWithPhoto({ source: Buffer.from(image.encodedImage, 'base64') });
     await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt, [image]);
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
     const errorMessage = error.response?.status === 401
       ? 'Authentication failed. Please update token with /set_token.'
@@ -746,6 +739,7 @@ bot.command('edit', checkAuth, async (ctx) => {
       await sendDebugToAdmin(ctx, `Gemini Edit Error: No image generated`);
       throw new Error('No image generated.');
     }
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
     const errorMessage = error.response?.status === 401
       ? 'Gemini authentication failed. Contact admin to update API keys.'
@@ -859,6 +853,7 @@ bot.command('ic', checkAuth, async (ctx) => {
       await sendDebugToAdmin(ctx, `Gemini Error: No text response after all attempts`);
       throw new Error('No valid text response generated.');
     }
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
     const errorMessage = error.response?.status === 401
       ? 'Gemini authentication failed. Contact admin to update API keys.'
@@ -905,7 +900,7 @@ bot.command('sti', checkAuth, async (ctx) => {
     }
 
     await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username || '', 0, 1);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Sticker conversion', [{ encodedImage: Buffer.from(response.data).toString('base64') }]);
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Sticker conversion');
 
   } catch (error) {
     const errorMessage = `Error converting sticker: ${error.message}`;
@@ -948,7 +943,7 @@ bot.command('its', checkAuth, async (ctx) => {
     await ctx.replyWithSticker({ source: resizedImage });
 
     await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username || '', 1, 0);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Image to sticker conversion', [{ encodedImage: resizedImage.toString('base64') }]);
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Image to sticker conversion');
   } catch (error) {
     const errorMessage = error.message.includes('Image exceeds')
       ? error.message
@@ -960,10 +955,17 @@ bot.command('its', checkAuth, async (ctx) => {
   }
 });
 
-// Start bot
-bot.launch();
-console.log('Bot started as ARC71');
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('hello');
+});
 
 app.listen(process.env.PORT || 3000, () => {
   console.log('Server running on port', process.env.PORT || 3000);
 });
+
+// Start bot
+bot.launch();
+console.log('Bot started as ARC71');
