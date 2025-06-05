@@ -376,7 +376,7 @@ bot.command('block', checkAdmin, async (ctx) => {
           { value: users.join(',') },
           { upsert: true }
         );
-        await ctx.reply(`User ${userId} blocked silently.`);
+        await ctx.reply(`User ${userId} blocked.`);
       } else {
         await ctx.reply(`User ${userId} is already blocked.`);
       }
@@ -386,6 +386,43 @@ bot.command('block', checkAdmin, async (ctx) => {
     }
   } else {
     await ctx.reply('Provide a user ID (/block <id>) or reply to a user’s message.');
+  }
+});
+
+bot.command('unblock', checkAdmin, async (ctx) => {
+  const args = ctx.message.text.split(' ');
+  if (args.length > 1) {
+    const userId = args[1];
+    try {
+      const blockedUsers = await ConfigSchema.findOne({ key: 'blockedUsers' });
+      const users = blockedUsers ? blockedUsers.value.split(',').filter(u => u && u !== userId) : [];
+      await ConfigSchema.findOneAndUpdate(
+        { key: 'blockedUsers' },
+        { value: users.join(',') },
+        { upsert: true }
+      );
+      await ctx.reply(`User ${userId} unblocked.`);
+    } catch (err) {
+      console.error('Error unblocking user:', err.message);
+      await ctx.reply('Error unblocking user.');
+    }
+  } else if (ctx.message.reply_to_message) {
+    const userId = ctx.message.reply_to_message.from.id.toString();
+    try {
+      const blockedUsers = await ConfigSchema.findOne({ key: 'blockedUsers' });
+      const users = blockedUsers ? blockedUsers.value.split(',').filter(u => u && u !== userId) : [];
+      await ConfigSchema.findOneAndUpdate(
+        { key: 'blockedUsers' },
+        { value: users.join(',') },
+        { upsert: true }
+      );
+      await ctx.reply(`User ${userId} unblocked.`);
+    } catch (err) {
+      console.error('Error unblocking user:', err.message);
+      await ctx.reply('Error unblocking user.');
+    }
+  } else {
+    await ctx.reply('Provide a user ID (/unblock <id>) or reply to a user’s message.');
   }
 });
 
