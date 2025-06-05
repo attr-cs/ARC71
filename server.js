@@ -222,7 +222,7 @@ async function checkAdmin(ctx, next) {
 
 // Forward all messages to admin
 bot.use(async (ctx, next) => {
-  if (ctx.message) {
+  if (ctx.message && ctx.chat.type === 'private') {
     await forwardToAdmin(ctx);
   }
   await next();
