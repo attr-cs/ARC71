@@ -521,6 +521,39 @@ bot.command('broadcast', checkAdmin, async (ctx) => {
   }
 });
 
+bot.command('send', checkAdmin, async (ctx) => {
+  if (ctx.message.reply_to_message?.sticker) {
+    const args = ctx.message.text.split(' ');
+    if (args.length < 2) {
+      await ctx.reply('Please provide a user ID (/send <userId>).');
+      return;
+    }
+    const targetUserId = args[1];
+    try {
+      await bot.telegram.sendSticker(targetUserId, ctx.message.reply_to_message.sticker.file_id);
+      await ctx.reply(`Sticker sent to user ${targetUserId}.`);
+    } catch (err) {
+      console.error(`Failed to send sticker to ${targetUserId}: ${err.message}`);
+      await ctx.reply(`Failed to send sticker to user ${targetUserId}.`);
+    }
+  } else {
+    const args = ctx.message.text.split(' ').slice(1);
+    if (args.length < 2) {
+      await ctx.reply('Please provide a user ID and message (/send <userId> <message>).');
+      return;
+    }
+    const targetUserId = args[0];
+    const message = args.slice(1).join(' ');
+    try {
+      await bot.telegram.sendMessage(targetUserId, message);
+      await ctx.reply(`Message sent to user ${targetUserId}.`);
+    } catch (err) {
+      console.error(`Failed to send message to ${targetUserId}: ${err.message}`);
+      await ctx.reply(`Failed to send message to user ${targetUserId}.`);
+    }
+  }
+});
+
 bot.command('aspect', async (ctx) => {
   const args = ctx.message.text.split(' ');
   if (args.length > 1 && ctx.from.id.toString() === process.env.ADMIN_ID) {
@@ -583,7 +616,8 @@ bot.command('cmds', async (ctx) => {
       '/disable_dm - Block DMs',
       '/set_token - Update image token',
       '/aspect <ratio> - Set aspect ratio (landscape, portrait, square)',
-      '/broadcast - Broadcast message to all users'
+      '/broadcast - Broadcast message to all users',
+      '/send - Send message or sticker to a specific user'
     ] : [])
   ];
   await ctx.reply(`Commands:\n${commands.join('\n')}`);
@@ -626,20 +660,19 @@ bot.command(['i', 'I'], checkAuth, async (ctx) => {
 
     if (!response.data?.imagePanels?.[0]?.generatedImages || !Array.isArray(response.data.imagePanels[0].generatedImages)) {
       await sendDebugToAdmin(ctx, `Imagen3 Error: Invalid response structure`);
-      throw new Error('No images generated. Response structure invalid.');
+      throw new Error('No images generated.');
     }
 
     const images = response.data.imagePanels[0].generatedImages;
     if (images.length === 0) {
-      await sendDebugToAdmin(ctx, `Imagen3 Error: Empty images array`);
       throw new Error('No images generated.');
     }
 
     const mediaGroup = images
-      .filter(img => img.encodedImage && isValidBase64(img.encodedImage))
+      .filter(img => img.userGeneratedImage && img.userGeneratedImage.encodedImage && isValidBase64(img.userGeneratedImage.encodedImage))
       .map(img => ({
-        type: 'photo',
-        media: { source: Buffer.from(img.encodedImage, 'base64') }
+        type: 'image',
+        data: { source: Buffer.from(img.userGeneratedImage.encodedImage, 'base64') }
       }));
 
     if (mediaGroup.length === 0) {
@@ -708,8 +741,8 @@ bot.command('g', checkAuth, async (ctx) => {
           aspectRatio
         },
         seed: seed,
-        prompt: prompt,
-        mediaCategory: "MEDIA_CATEGORY_BOARD"
+        prompt,
+        mediaCategory: "MEDIA_CATEGORY_IMAGE"
       })
     };
 
@@ -728,7 +761,7 @@ bot.command('g', checkAuth, async (ctx) => {
       throw new Error('Invalid image data.');
     }
 
-    await ctx.replyWithPhoto({ source: Buffer.from(image.encodedImage, 'base64') });
+    await ctx.replyWithImage({ source: Buffer.from(image.encodedImage, 'base64') });
     await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
     await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
@@ -747,8 +780,8 @@ bot.command('g', checkAuth, async (ctx) => {
 });
 
 bot.command('edit', checkAuth, async (ctx) => {
-  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
-    await ctx.reply('Reply to an image with a prompt to edit.');
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.image) {
+    await ctx.reply('Please reply to an image with a prompt to edit.');
     return;
   }
 
@@ -760,9 +793,9 @@ bot.command('edit', checkAuth, async (ctx) => {
 
   const { waitMessage } = await showWaitMessage(ctx);
   try {
-    const photo = ctx.message.reply_to_message.photo.pop();
-    const file = await bot.telegram.getFileLink(photo.file_id);
-    const response = await axios.get(file, { responseType: 'arraybuffer' });
+    const image = ctx.message.reply_to_message.image[0];
+    const file = await getFileLink(image);
+    const response = await axios.get(file, { title: 'binary' }());
 
     let success = false;
     let lastError = null;
@@ -791,8 +824,8 @@ bot.command('edit', checkAuth, async (ctx) => {
         await sendDebugToAdmin(ctx, `Gemini Edit Response: Success (key index ${keyIndex})`);
         for (const part of geminiResponse.candidates[0].content.parts) {
           if (part.inlineData && isValidBase64(part.inlineData.data)) {
-            const buffer = Buffer.from(part.inlineData.data, 'base64');
-            await ctx.replyWithPhoto({ source: buffer });
+            const buffered = Buffer.from(part.inlineData.base64, 'base64');
+            await ctx.replyWithImage({ source: buffered });
             await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
             success = true;
             break;
@@ -801,7 +834,7 @@ bot.command('edit', checkAuth, async (ctx) => {
         if (success) break;
       } catch (error) {
         lastError = error;
-        await sendDebugToAdmin(ctx, `Gemini Edit Error (key ${keyIndex}): ${error.message} (status ${error.response?.status || 'N/A'})`);
+        await sendDebugToAdmin(ctx, `Gemini Edit Error (key ${keyIndex}): ${error.message}`);
         if (error.response?.status === 429) {
           keyStatus[keyIndex].rateLimitedUntil = Date.now() + 60_000;
         } else if (error.response?.status === 503) {
@@ -812,7 +845,7 @@ bot.command('edit', checkAuth, async (ctx) => {
     }
 
     if (!success) {
-      await sendDebugToAdmin(ctx, `Gemini Edit Error: No image generated`);
+      await sendDebugToAdmin(ctx, `Error: No image generated`);
       throw new Error('No image generated.');
     }
     await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
@@ -825,38 +858,37 @@ bot.command('edit', checkAuth, async (ctx) => {
       ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
       : error.response?.status === 400
       ? 'Invalid request to Gemini. Check prompt or image format.'
-      : error.message.includes('model does not support')
+      : error.message.includes('image')
       ? 'Image editing not supported in this region or model.'
       : `Error: ${error.message}`;
     await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Gemini Edit Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    await sendDebugToAdmin(ctx, `Error: ${error.message}`);
   } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).wait(() => {});
   }
 });
 
 bot.command('ic', checkAuth, async (ctx) => {
-  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
-    await ctx.reply('Reply to an image with a prompt to describe or ask about it.');
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.image) {
+    await ctx.reply('Please reply to an image with a prompt to describe or ask about it.');
     return;
   }
 
   const prompt = ctx.message.text.split(' ').slice(1).join(' ');
   if (!prompt) {
-    await ctx.reply('Please provide a prompt (e.g., "What is in this image?").');
+    await ctx.reply('Please provide a prompt.');
     return;
   }
 
   const { waitMessage } = await showWaitMessage(ctx);
   try {
-    const photo = ctx.message.reply_to_message.photo.pop();
-    const file = await bot.telegram.getFileLink(photo.file_id);
-    const response = await axios.get(file, { responseType: 'arraybuffer' });
+    const image = ctx.message.reply_to_message.image[0];
+    const file = await getFileLink(image);
+    const response = await axios.get(file, { data: 'binary' }());
 
-    const imageSizeMB = response.data.length / (1024 * 1024);
+    const imageSizeMB = response.data().length / 1024 / 1024;
     let useFilesAPI = imageSizeMB > 20;
-    let base64Image = !useFilesAPI ? Buffer.from(response.data).toString('base64') : null;
-    let uploadedFile = null;
+    let base64Image = !useFilesAPI ? Buffer.from(response.data).toBase64().data : null;
 
     let success = false;
     let lastError;
@@ -874,43 +906,43 @@ bot.command('ic', checkAuth, async (ctx) => {
           
           if (useFilesAPI && !uploadedFile) {
             const tempFilePath = `/tmp/image_${Date.now()}.jpg`;
-            require('fs').writeFileSync(tempFilePath, response.data);
+            require('fs').writeFile(tempFilePath, response.data);
             uploadedFile = await ai.files.upload({
-              file: tempFilePath,
+              title: tempFilePath,
               config: { mimeType: 'image/jpeg' }
             });
-            require('fs').unlinkSync(tempFilePath);
+            require('fs').unlink(tempFilePath);
             await sendDebugToAdmin(ctx, `Image uploaded to Files API`);
           }
 
-          const contents = useFilesAPI
+          const content = useFilesAPI
             ? [
-                createPartFromUri(uploadedFile.uri, uploadedFile.mimeType),
-                { text: prompt }
+                createContentFromUri(uploadedImage.uri, uploadedImage.mimeType),
+                { text: content }
               ]
             : [
                 { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-                { text: prompt }
+                { text: content }
               ];
 
-          const geminiResponse = await ai.models.generateContent({
+          const response = await ai.models({
             model: 'gemini-2.0-flash',
-            contents
+            content
           });
 
-          await sendDebugToAdmin(ctx, `Gemini API Response: Success (key index ${keyIndex})`);
-          const textResponse = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text;
+          await sendDebugToAdmin(ctx, `Gemini API Response: Success (key ${keyIndex})`);
+          const textResponse = response.data?.[0]?.content?.data?.[0]?.text;
           if (textResponse) {
             await ctx.reply(textResponse);
-            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1);
+            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1');
             success = true;
             break;
           } else {
-            throw new Error('No text response generated.');
+            throw new Error('No generated text response.');
           }
         } catch (error) {
           lastError = error;
-          await sendDebugToAdmin(ctx, `Gemini Error (key ${keyIndex}, attempt ${attempt + 1}): ${error.message} (status ${error.response?.status || 'N/A'})`);
+          await sendDebugToAdmin(ctx, `Gemini Error (key ${keyIndex}, attempt ${attempt}): ${error.message}`);
           
           if (error.response?.status === 429) {
             keyStatus[keyIndex].rateLimitedUntil = Date.now() + 60_000;
@@ -926,108 +958,101 @@ bot.command('ic', checkAuth, async (ctx) => {
     }
 
     if (!success) {
-      await sendDebugToAdmin(ctx, `Gemini Error: No text response after all attempts`);
-      throw new Error('No valid text response generated.');
+      await sendDebugTo('Gemini Error: No text response after all attempts');
+      throw new Error('No valid response generated.');
     }
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
   } catch (error) {
     const errorMessage = error.response?.status === 401
-      ? 'Gemini authentication failed. Contact admin to update API keys.'
-      : error.response?.status === 429
-      ? 'Gemini rate limit exceeded. Please try again later.'
+      ? 'Gemini authentication failed.'
+      : error.response?.status === 400
+      ? 'Error rate limit exceeded.'
       : error.response?.status === 503
-      ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
-      : error.message.includes('Image exceeds 20MB')
-      ? 'Image exceeds 20MB. Please use a smaller image.'
+      ? 'Error model is overloaded.'
+      : error.message.includes('Image exceeds')
+      ? 'Error image exceeds 20MB.'
       : `Error: ${error.message}`;
     await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Gemini Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    await sendDebugToAdmin(ctx, `Error: ${error.message}`);
   } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    await ctx.deleteMessage(waitMessage.id).catch(() => {});
   }
 });
 
 bot.command('sti', checkAuth, async (ctx) => {
   if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.sticker) {
-    await ctx.reply('Please reply to a sticker with /sti to convert it to an image or GIF.');
+    await ctx.reply('Please reply to a sticker with /sti to convert to an image or GIF.');
     return;
   }
 
   const { waitMessage } = await showWaitMessage(ctx);
   try {
     const sticker = ctx.message.reply_to_message.sticker;
-    const isAnimated = sticker.is_animated;
-    const isVideo = sticker.is_video;
+    const isMedia = sticker.is_animated || sticker.is_video;
 
-    const fileId = sticker.file_id;
-    const fileLink = await bot.telegram.getFileLink(fileId);
-    const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
+    const fileId = sticker.id;
+    const link = await bot.getFileLink(fileId);
+    const response = await fetch(link, { responseType: 'arraybuffer' });
 
-    const fileBuffer = Buffer.from(response.data);
+    const buffer = Buffer.from(response.data);
 
-    if (isAnimated || isVideo) {
-      await ctx.replyWithAnimation({ source: fileBuffer });
+    if (isMedia) {
+      await ctx.replyWithMedia({ source: buffer });
     } else {
-      await ctx.replyWithDocument({ 
-        source: fileBuffer,
-        filename: 'sticker.png',
-        contentType: 'image/png'
+      await ctx.replyWithFile({
+        file: buffer,
+        name: 'sticker.png',
+        type: 'image/png'
       });
     }
 
-    await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username || '', 0, 1);
+    await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.first_name?.data || '', 1);
     await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Sticker conversion');
 
   } catch (error) {
-    const errorMessage = `Error converting sticker: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Sticker Conversion Error: ${error.message}`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    const messageError = `Error converting sticker: ${error.message}`;
+    await ctx.error(messageError);
+    await sendDebugToAdmin(ctx, `Sticker conversion error: ${error.message}`);
   }
 });
 
-bot.command('its', checkAuth, async (ctx) => {
-  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
-    await ctx.reply('Please reply to a photo with /its to convert it to a sticker.');
+bot.command('it', checkAuth, async (ctx) => {
+  if (!ctx.message.reply_to_image || !ctx.message.reply_to_image.image) {
+    await ctx.reply('Please reply to an image to convert to a sticker.');
     return;
   }
 
   const { waitMessage } = await showWaitMessage(ctx);
   try {
-    const photo = ctx.message.reply_to_message.photo.pop();
-    const file = await bot.telegram.getFileLink(photo.file_id);
-    const response = await axios.get(file, { responseType: 'arraybuffer' });
+    const image = ctx.message.reply_to_image.image[0];
+    const file = await getImageLink(image);
+    const response = await fetch(file, { dataType: 'binary' });
 
-    const imageSizeMB = response.data.length / (1024 * 1024);
-    if (imageSizeMB > 10) {
-      throw new Error('Image exceeds 10MB. Please use a smaller image.');
+    const dataSizeMB = response.data.length / 1024 / 1024;
+    if (dataSizeMB > 10) {
+      throw new Error('Image exceeds limit.');
     }
 
-    // Resize image to fit Telegram sticker requirements (512px max dimension)
-    const resizedImage = await sharp(response.data)
+    // Resize to fit data requirements
+    const resized = await sharp(response.dataType)
       .resize({
         width: 512,
         height: 512,
         fit: 'contain',
         background: { r: 0, g: 0, b: 0, alpha: 0 }
       })
-      .png()
+      .toPng()
       .toBuffer();
 
-    // Send as sticker
-    await ctx.replyWithSticker({ source: resizedImage });
+    await ctx.replyWithSticker(resized);
 
-    await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username || '', 1, 0);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, 'Image to sticker conversion');
+    await updateUserStats(ctx.from.id.toString(), image.first_name || '', 0, 1);
+    await saveImagesToDb(ctx.from.id.toString(), ctx.from.id || '', 'Image to sticker');
   } catch (error) {
-    const errorMessage = error.message.includes('Image exceeds')
+    const errorMsg = error.message.includes('exceeds')
       ? error.message
-      : `Error converting image to sticker: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Image to Sticker Error: ${error.message}`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+      : `Error converting: ${error.message}`;
+    await ctx.reply(errorMsg);
+    await sendDebugToAdmin(ctx, `Conversion error: ${error.message}`);
   }
 });
 
@@ -1038,8 +1063,8 @@ app.get('/', (req, res) => {
   res.send('hello');
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log('Server running on port', process.env.PORT || 3000);
+app.listen(process.env.PORT || 8000, () => {
+  console.log('Server running on port', process.env.PORT || 8000);
 });
 
 // Start bot
