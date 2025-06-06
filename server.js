@@ -56,6 +56,39 @@ const geminiApiKeys = [
 const keyStatus = geminiApiKeys.map(() => ({ rateLimitedUntil: 0 }));
 const rateLimitedUntil = { timestamp: 0 };
 
+// Queue for sequential commands
+const commandQueue = [];
+let isProcessingQueue = false;
+
+async function processQueue() {
+  if (isProcessingQueue || commandQueue.length === 0) return;
+  isProcessingQueue = true;
+
+  const { ctx, handler, waitMessageId } = commandQueue.shift();
+  try {
+    await handler(ctx);
+  } catch (err) {
+    console.error('Queue processing error:', err.message);
+    await ctx.reply('An error occurred while processing your command.');
+  } finally {
+    await bot.telegram.deleteMessage(ctx.chat.id, waitMessageId).catch(() => {});
+    isProcessingQueue = false;
+    processQueue(); // Process next command in queue
+  }
+}
+
+function enqueueCommand(ctx, handler) {
+  return new Promise(async (resolve) => {
+    const waitMessage = await ctx.reply('Your command is queued. Please wait...', {
+      disable_web_page_preview: true,
+      disable_notification: true
+    });
+    commandQueue.push({ ctx, handler, waitMessageId: waitMessage.message_id });
+    processQueue();
+    resolve();
+  });
+}
+
 // Helper functions
 async function isAuthorizedUser(userId) {
   const allowedUsers = await ConfigSchema.findOne({ key: 'allowedUsers' });
@@ -268,20 +301,9 @@ bot.command('start', async (ctx) => {
   await ctx.reply('Ready');
 });
 
-bot.command('id', async (ctx) => {
-  const chat = ctx.chat;
-  const user = ctx.from;
-  const groupInfo = chat.type !== 'private' ? {
-    groupId: chat.id,
-    groupTitle: chat.title || 'N/A',
-    groupType: chat.type,
-  } : {};
-  await ctx.reply(`User ID: ${user.id}\nUsername: @${user.username || 'N/A'}\nFirst Name: ${user.first_name || 'N/A'}\n${chat.type !== 'private' ? `Group ID: ${groupInfo.groupId}\nGroup Title: ${groupInfo.groupTitle}` : ''}`);
-});
-
-bot.command('id', checkAdmin, async (ctx) => {
+bot.command('id', async (ctx, next) => {
   const args = ctx.message.text.split(' ');
-  if (args.length > 1) {
+  if (args.length > 1 && ctx.from.id.toString() === process.env.ADMIN_ID) {
     const groupId = args[1];
     try {
       const currentGroups = await ConfigSchema.findOne({ key: 'allowedGroups' });
@@ -301,6 +323,15 @@ bot.command('id', checkAdmin, async (ctx) => {
       console.error('Error authorizing group:', err.message);
       await ctx.reply('Error authorizing group.');
     }
+  } else {
+    const chat = ctx.chat;
+    const user = ctx.from;
+    const groupInfo = chat.type !== 'private' ? {
+      groupId: chat.id,
+      groupTitle: chat.title || 'N/A',
+      groupType: chat.type,
+    } : {};
+    await ctx.reply(`User ID: ${user.id}\nUsername: @${user.username || 'N/A'}\nFirst Name: ${user.first_name || 'N/A'}\n${chat.type !== 'private' ? `Group ID: ${groupInfo.groupId}\nGroup Title: ${groupInfo.groupTitle}` : ''}`);
   }
 });
 
@@ -590,361 +621,369 @@ bot.command('cmds', async (ctx) => {
 });
 
 bot.command(['i', 'I'], checkAuth, async (ctx) => {
-  const prompt = ctx.message.text.split(' ').slice(1).join(' ');
-  if (!prompt) {
-    await ctx.reply('Please provide a prompt for Imagen3.');
-    return;
-  }
-
-  const { waitMessage } = await showWaitMessage(ctx);
-  try {
-    const aspectRatio = await getAspectRatio();
-    const data = JSON.stringify({
-      userInput: { candidatesCount: 4, prompts: [prompt], seed: 206167 },
-      clientContext: { sessionId: `;${Date.now()}`, tool: "IMAGE_FX" },
-      modelInput: { modelNameType: "IMAGEN_3_1" },
-      aspectRatio
-    });
-
-    const config = {
-      method: 'post',
-      maxBodyLength: Infinity,
-      url: 'https://aisandbox-pa.googleapis.com/v1:runImageFx',
-      headers: {
-        'accept': '*/*',
-        'authorization': `Bearer ${imageToken}`,
-        'content-type': 'text/plain;charset=UTF-8',
-        'origin': 'https://labs.google',
-        'user-agent': await getRandomUserAgent()
-      },
-      data: data
-    };
-
-    const response = await axios.request(config);
-
-    await sendDebugToAdmin(ctx, `Imagen3 Response: Success (status ${response.status})`);
-
-    if (!response.data?.imagePanels?.[0]?.generatedImages || !Array.isArray(response.data.imagePanels[0].generatedImages)) {
-      await sendDebugToAdmin(ctx, `Imagen3 Error: Invalid response structure`);
-      throw new Error('No images generated. Response structure invalid.');
-    }
-
-    const images = response.data.imagePanels[0].generatedImages;
-    if (images.length === 0) {
-      await sendDebugToAdmin(ctx, `Imagen3 Error: Empty images array`);
-      throw new Error('No images generated.');
-    }
-
-    const mediaGroup = images
-      .filter(img => img.encodedImage && isValidBase64(img.encodedImage))
-      .map(img => ({
-        type: 'photo',
-        media: { source: Buffer.from(img.encodedImage, 'base64') }
-      }));
-
-    if (mediaGroup.length === 0) {
-      await sendDebugToAdmin(ctx, `Imagen3 Error: No valid images`);
-      throw new Error('No valid images generated.');
-    }
-
-    await ctx.replyWithMediaGroup(mediaGroup);
-    await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, mediaGroup.length);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
-  } catch (error) {
-    const errorMessage = error.response?.status === 401
-      ? 'Authentication failed. Please update token with /set_token.'
-      : error.response?.status === 429
-      ? `Rate limit exceeded. Please try again in ${error.response?.data?.parameters?.retry_after || 30} seconds.`
-      : error.response?.status === 503
-      ? 'Imagen3 service is temporarily overloaded. Please try again later.'
-      : `Error: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Imagen3 Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
-  }
-});
-
-bot.command('g', checkAuth, async (ctx) => {
-  const prompt = ctx.message.text.split(' ').slice(1).join(' ');
-  if (!prompt) {
-    await ctx.reply('Please provide a prompt for Imagen4.');
-    return;
-  }
-
-  const { waitMessage } = await showWaitMessage(ctx);
-  try {
-    if (!imageToken) {
-      throw new Error('Image token not set. Please set it with /set_token.');
-    }
-
-    const now = Date.now();
-    if (rateLimitedUntil.timestamp > now) {
-      await ctx.reply(`Rate limit active until ${new Date(rateLimitedUntil.timestamp).toISOString()}. Please try again later.`);
+  await enqueueCommand(ctx, async (ctx) => {
+    const prompt = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!prompt) {
+      await ctx.reply('Please provide a prompt for Imagen3.');
       return;
     }
 
-    const seed = Math.floor(Math.random() * 1000000);
-    const aspectRatio = await getAspectRatio();
-    const config = {
-      method: 'post',
-      maxBodyLength: Infinity,
-      url: 'https://aisandbox-pa.googleapis.com/v1/whisk:generateImage',
-      headers: {
-        'accept': '*/*',
-        'authorization': `Bearer ${imageToken}`,
-        'content-type': 'text/plain;charset=UTF-8',
-        'origin': 'https://labs.google',
-        'user-agent': getRandomUserAgent()
-      },
-      data: JSON.stringify({
-        clientContext: {
-          workflowId: "91cbbef0-75a4-4352-8d03-4f66226c6afc",
-          tool: "BACKBONE",
-          sessionId: `;${Date.now()}`
+    const { waitMessage } = await showWaitMessage(ctx);
+    try {
+      const aspectRatio = await getAspectRatio();
+      const data = JSON.stringify({
+        userInput: { candidatesCount: 4, prompts: [prompt], seed: 206167 },
+        clientContext: { sessionId: `;${Date.now()}`, tool: "IMAGE_FX" },
+        modelInput: { modelNameType: "IMAGEN_3_1" },
+        aspectRatio
+      });
+
+      const config = {
+        method: 'post',
+        maxBodyLength: Infinity,
+        url: 'https://aisandbox-pa.googleapis.com/v1:runImageFx',
+        headers: {
+          'accept': '*/*',
+          'authorization': `Bearer ${imageToken}`,
+          'content-type': 'text/plain;charset=UTF-8',
+          'origin': 'https://labs.google',
+          'user-agent': await getRandomUserAgent()
         },
-        imageModelSettings: {
-          imageModel: "IMAGEN_3_5",
-          aspectRatio
-        },
-        seed: seed,
-        prompt: prompt,
-        mediaCategory: "MEDIA_CATEGORY_BOARD"
-      })
-    };
+        data: data
+      };
 
-    const response = await axios.request(config);
+      const response = await axios.request(config);
 
-    await sendDebugToAdmin(ctx, `Imagen4 Response: Success (status ${response.status})`);
+      await sendDebugToAdmin(ctx, `Imagen3 Response: Success (status ${response.status})`);
 
-    if (!response.data?.imagePanels?.[0]?.generatedImages?.[0]?.encodedImage) {
-      await sendDebugToAdmin(ctx, `Imagen4 Error: Invalid response structure`);
-      throw new Error('Invalid response structure.');
+      if (!response.data?.imagePanels?.[0]?.generatedImages || !Array.isArray(response.data.imagePanels[0].generatedImages)) {
+        await sendDebugToAdmin(ctx, `Imagen3 Error: Invalid response structure`);
+        throw new Error('No images generated. Response structure invalid.');
+      }
+
+      const images = response.data.imagePanels[0].generatedImages;
+      if (images.length === 0) {
+        await sendDebugToAdmin(ctx, `Imagen3 Error: Empty images array`);
+        throw new Error('No images generated.');
+      }
+
+      const mediaGroup = images
+        .filter(img => img.encodedImage && isValidBase64(img.encodedImage))
+        .map(img => ({
+          type: 'photo',
+          media: { source: Buffer.from(img.encodedImage, 'base64') }
+        }));
+
+      if (mediaGroup.length === 0) {
+        await sendDebugToAdmin(ctx, `Imagen3 Error: No valid images`);
+        throw new Error('No valid images generated.');
+      }
+
+      await ctx.replyWithMediaGroup(mediaGroup);
+      await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, mediaGroup.length);
+      await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
+    } catch (error) {
+      const errorMessage = error.response?.status === 401
+        ? 'Authentication failed. Please update token with /set_token.'
+        : error.response?.status === 429
+        ? `Rate limit exceeded. Please try again in ${error.response?.data?.parameters?.retry_after || 30} seconds.`
+        : error.response?.status === 503
+        ? 'Imagen3 service is temporarily overloaded. Please try again later.'
+        : `Error: ${error.message}`;
+      await ctx.reply(errorMessage);
+      await sendDebugToAdmin(ctx, `Imagen3 Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    } finally {
+      await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    }
+  });
+});
+
+bot.command('g', checkAuth, async (ctx) => {
+  await enqueueCommand(ctx, async (ctx) => {
+    const prompt = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!prompt) {
+      await ctx.reply('Please provide a prompt for Imagen4.');
+      return;
     }
 
-    const image = response.data.imagePanels[0].generatedImages[0];
-    if (!image.encodedImage || !isValidBase64(image.encodedImage)) {
-      await sendDebugToAdmin(ctx, `Imagen4 Error: Invalid image data`);
-      throw new Error('Invalid image data.');
-    }
+    const { waitMessage } = await showWaitMessage(ctx);
+    try {
+      if (!imageToken) {
+        throw new Error('Image token not set. Please set it with /set_token.');
+      }
 
-    await ctx.replyWithPhoto({ source: Buffer.from(image.encodedImage, 'base64') });
-    await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
-  } catch (error) {
-    const errorMessage = error.response?.status === 401
-      ? 'Authentication failed. Please update token with /set_token.'
-      : error.response?.status === 429
-      ? `Rate limit exceeded. Please try again in ${error.response?.data?.parameters?.retry_after || 30} seconds.`
-      : error.response?.status === 503
-      ? 'Imagen4 service is temporarily overloaded.'
-      : `Error: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Imagen4 Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
-  }
+      const now = Date.now();
+      if (rateLimitedUntil.timestamp > now) {
+        await ctx.reply(`Rate limit active until ${new Date(rateLimitedUntil.timestamp).toISOString()}. Please try again later.`);
+        return;
+      }
+
+      const seed = Math.floor(Math.random() * 1000000);
+      const aspectRatio = await getAspectRatio();
+      const config = {
+        method: 'post',
+        maxBodyLength: Infinity,
+        url: 'https://aisandbox-pa.googleapis.com/v1/whisk:generateImage',
+        headers: {
+          'accept': '*/*',
+          'authorization': `Bearer ${imageToken}`,
+          'content-type': 'text/plain;charset=UTF-8',
+          'origin': 'https://labs.google',
+          'user-agent': getRandomUserAgent()
+        },
+        data: JSON.stringify({
+          clientContext: {
+            workflowId: "91cbbef0-75a4-4352-8d03-4f66226c6afc",
+            tool: "BACKBONE",
+            sessionId: `;${Date.now()}`
+          },
+          imageModelSettings: {
+            imageModel: "IMAGEN_3_5",
+            aspectRatio
+          },
+          seed: seed,
+          prompt: prompt,
+          mediaCategory: "MEDIA_CATEGORY_BOARD"
+        })
+      };
+
+      const response = await axios.request(config);
+
+      await sendDebugToAdmin(ctx, `Imagen4 Response: Success (status ${response.status})`);
+
+      if (!response.data?.imagePanels?.[0]?.generatedImages?.[0]?.encodedImage) {
+        await sendDebugToAdmin(ctx, `Imagen4 Error: Invalid response structure`);
+        throw new Error('Invalid response structure.');
+      }
+
+      const image = response.data.imagePanels[0].generatedImages[0];
+      if (!image.encodedImage || !isValidBase64(image.encodedImage)) {
+        await sendDebugToAdmin(ctx, `Imagen4 Error: Invalid image data`);
+        throw new Error('Invalid image data.');
+      }
+
+      await ctx.replyWithPhoto({ source: Buffer.from(image.encodedImage, 'base64') });
+      await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
+      await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
+    } catch (error) {
+      const errorMessage = error.response?.status === 401
+        ? 'Authentication failed. Please update token with /set_token.'
+        : error.response?.status === 429
+        ? `Rate limit exceeded. Please try again in ${error.response?.data?.parameters?.retry_after || 30} seconds.`
+        : error.response?.status === 503
+        ? 'Imagen4 service is temporarily overloaded.'
+        : `Error: ${error.message}`;
+      await ctx.reply(errorMessage);
+      await sendDebugToAdmin(ctx, `Imagen4 Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    } finally {
+      await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    }
+  });
 });
 
 bot.command('edit', checkAuth, async (ctx) => {
-  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
-    await ctx.reply('Reply to an image with a prompt to edit.');
-    return;
-  }
-
-  const prompt = ctx.message.text.split(' ').slice(1).join(' ');
-  if (!prompt) {
-    await ctx.reply('Please provide an edit prompt.');
-    return;
-  }
-
-  const { waitMessage } = await showWaitMessage(ctx);
-  try {
-    const photo = ctx.message.reply_to_message.photo.pop();
-    const file = await bot.telegram.getFileLink(photo.file_id);
-    const response = await axios.get(file, { responseType: 'arraybuffer' });
-
-    let success = false;
-    let lastError = null;
-    const triedKeys = new Set();
-
-    for (let i = 0; i < geminiApiKeys.length; i++) {
-      const keyIndex = getRandomKeyIndex();
-      if (triedKeys.has(keyIndex)) continue;
-      triedKeys.add(keyIndex);
-      const apiKey = geminiApiKeys[keyIndex];
-      try {
-        const ai = new GoogleGenAI({ apiKey });
-        const contents = [
-          { text: prompt },
-          { inlineData: { mimeType: 'image/png', data: Buffer.from(response.data).toString('base64') } }
-        ];
-
-        const geminiResponse = await ai.models.generateContent({
-          model: 'gemini-2.0-flash-preview-image-generation',
-          contents,
-          config: {
-            responseModalities: ['TEXT', 'IMAGE']
-          }
-        });
-
-        await sendDebugToAdmin(ctx, `Gemini Edit Response: Success (key index ${keyIndex})`);
-        for (const part of geminiResponse.candidates[0].content.parts) {
-          if (part.inlineData && isValidBase64(part.inlineData.data)) {
-            const buffer = Buffer.from(part.inlineData.data, 'base64');
-            await ctx.replyWithPhoto({ source: buffer });
-            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
-            success = true;
-            break;
-          }
-        }
-        if (success) break;
-      } catch (error) {
-        lastError = error;
-        await sendDebugToAdmin(ctx, `Gemini Edit Error (key ${keyIndex}): ${error.message} (status ${error.response?.status || 'N/A'})`);
-        if (error.response?.status === 429) {
-          keyStatus[keyIndex].rateLimitedUntil = Date.now() + 60_000;
-        } else if (error.response?.status === 503) {
-          await delay(2000);
-          continue;
-        }
-      }
+  await enqueueCommand(ctx, async (ctx) => {
+    if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
+      await ctx.reply('Reply to an image with a prompt to edit.');
+      return;
     }
 
-    if (!success) {
-      await sendDebugToAdmin(ctx, `Gemini Edit Error: No image generated`);
-      throw new Error('No image generated.');
+    const prompt = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!prompt) {
+      await ctx.reply('Please provide an edit prompt.');
+      return;
     }
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
-  } catch (error) {
-    const errorMessage = error.response?.status === 401
-      ? 'Gemini authentication failed. Contact admin to update API keys.'
-      : error.response?.status === 429
-      ? 'Gemini rate limit exceeded. Try again later.'
-      : error.response?.status === 503
-      ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
-      : error.response?.status === 400
-      ? 'Invalid request to Gemini. Check prompt or image format.'
-      : error.message.includes('model does not support')
-      ? 'Image editing not supported in this region or model.'
-      : `Error: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Gemini Edit Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
-  }
-});
 
-bot.command('ic', checkAuth, async (ctx) => {
-  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
-    await ctx.reply('Reply to an image with a prompt to describe or ask about it.');
-    return;
-  }
+    const { waitMessage } = await showWaitMessage(ctx);
+    try {
+      const photo = ctx.message.reply_to_message.photo.pop();
+      const file = await bot.telegram.getFileLink(photo.file_id);
+      const response = await axios.get(file, { responseType: 'arraybuffer' });
 
-  const prompt = ctx.message.text.split(' ').slice(1).join(' ');
-  if (!prompt) {
-    await ctx.reply('Please provide a prompt (e.g., "What is in this image?").');
-    return;
-  }
+      let success = false;
+      let lastError = null;
+      const triedKeys = new Set();
 
-  const { waitMessage } = await showWaitMessage(ctx);
-  try {
-    const photo = ctx.message.reply_to_message.photo.pop();
-    const file = await bot.telegram.getFileLink(photo.file_id);
-    const response = await axios.get(file, { responseType: 'arraybuffer' });
-
-    const imageSizeMB = response.data.length / (1024 * 1024);
-    let useFilesAPI = imageSizeMB > 20;
-    let base64Image = !useFilesAPI ? Buffer.from(response.data).toString('base64') : null;
-    let uploadedFile = null;
-
-    let success = false;
-    let lastError;
-    const triedKeys = new Set();
-
-    for (let i = 0; i < geminiApiKeys.length; i++) {
-      const keyIndex = await getRandomKeyIndex();
-      if (triedKeys.has(keyIndex)) continue;
-      triedKeys.add(keyIndex);
-      const apiKey = geminiApiKeys[keyIndex];
-      
-      for (let attempt = 0; attempt <= 3; attempt++) {
+      for (let i = 0; i < geminiApiKeys.length; i++) {
+        const keyIndex = getRandomKeyIndex();
+        if (triedKeys.has(keyIndex)) continue;
+        triedKeys.add(keyIndex);
+        const apiKey = geminiApiKeys[keyIndex];
         try {
-          const ai = new GoogleGenAI({ apiKey: apiKey });
-          
-          if (useFilesAPI && !uploadedFile) {
-            const tempFilePath = `/tmp/image_${Date.now()}.jpg`;
-            require('fs').writeFileSync(tempFilePath, response.data);
-            uploadedFile = await ai.files.upload({
-              file: tempFilePath,
-              config: { mimeType: 'image/jpeg' }
-            });
-            require('fs').unlinkSync(tempFilePath);
-            await sendDebugToAdmin(ctx, `Image uploaded to Files API`);
-          }
-
-          const contents = useFilesAPI
-            ? [
-                createPartFromUri(uploadedFile.uri, uploadedFile.mimeType),
-                { text: prompt }
-              ]
-            : [
-                { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-                { text: prompt }
-              ];
+          const ai = new GoogleGenAI({ apiKey });
+          const contents = [
+            { text: prompt },
+            { inlineData: { mimeType: 'image/png', data: Buffer.from(response.data).toString('base64') } }
+          ];
 
           const geminiResponse = await ai.models.generateContent({
-            model: 'gemini-2.0-flash',
-            contents
+            model: 'gemini-2.0-flash-preview-image-generation',
+            contents,
+            config: {
+              responseModalities: ['TEXT', 'IMAGE']
+            }
           });
 
-          await sendDebugToAdmin(ctx, `Gemini API Response: Success (key index ${keyIndex})`);
-          const textResponse = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (textResponse) {
-            await ctx.reply(textResponse);
-            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1);
-            success = true;
-            break;
-          } else {
-            throw new Error('No text response generated.');
+          await sendDebugToAdmin(ctx, `Gemini Edit Response: Success (key index ${keyIndex})`);
+          for (const part of geminiResponse.candidates[0].content.parts) {
+            if (part.inlineData && isValidBase64(part.inlineData.data)) {
+              const buffer = Buffer.from(part.inlineData.data, 'base64');
+              await ctx.replyWithPhoto({ source: buffer });
+              await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 1);
+              success = true;
+              break;
+            }
           }
+          if (success) break;
         } catch (error) {
           lastError = error;
-          await sendDebugToAdmin(ctx, `Gemini Error (key ${keyIndex}, attempt ${attempt + 1}): ${error.message} (status ${error.response?.status || 'N/A'})`);
-          
+          await sendDebugToAdmin(ctx, `Gemini Edit Error (key ${keyIndex}): ${error.message} (status ${error.response?.status || 'N/A'})`);
           if (error.response?.status === 429) {
             keyStatus[keyIndex].rateLimitedUntil = Date.now() + 60_000;
-            break;
           } else if (error.response?.status === 503) {
             await delay(2000);
             continue;
           }
-          break;
         }
       }
-      if (success) break;
+
+      if (!success) {
+        await sendDebugToAdmin(ctx, `Gemini Edit Error: No image generated`);
+        throw new Error('No image generated.');
+      }
+      await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
+    } catch (error) {
+      const errorMessage = error.response?.status === 401
+        ? 'Gemini authentication failed. Contact admin to update API keys.'
+        : error.response?.status === 429
+        ? 'Gemini rate limit exceeded. Try again later.'
+        : error.response?.status === 503
+        ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
+        : error.response?.status === 400
+        ? 'Invalid request to Gemini. Check prompt or image format.'
+        : error.message.includes('model does not support')
+        ? 'Image editing not supported in this region or model.'
+        : `Error: ${error.message}`;
+      await ctx.reply(errorMessage);
+      await sendDebugToAdmin(ctx, `Gemini Edit Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    } finally {
+      await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    }
+  });
+});
+
+bot.command('ic', checkAuth, async (ctx) => {
+  await enqueueCommand(ctx, async (ctx) => {
+    if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.photo) {
+      await ctx.reply('Reply to an image with a prompt to describe or ask about it.');
+      return;
     }
 
-    if (!success) {
-      await sendDebugToAdmin(ctx, `Gemini Error: No text response after all attempts`);
-      throw new Error('No valid text response generated.');
+    const prompt = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!prompt) {
+      await ctx.reply('Please provide a prompt (e.g., "What is in this image?").');
+      return;
     }
-    await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
-  } catch (error) {
-    const errorMessage = error.response?.status === 401
-      ? 'Gemini authentication failed. Contact admin to update API keys.'
-      : error.response?.status === 429
-      ? 'Gemini rate limit exceeded. Please try again later.'
-      : error.response?.status === 503
-      ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
-      : error.message.includes('Image exceeds 20MB')
-      ? 'Image exceeds 20MB. Please use a smaller image.'
-      : `Error: ${error.message}`;
-    await ctx.reply(errorMessage);
-    await sendDebugToAdmin(ctx, `Gemini Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
-  } finally {
-    await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
-  }
+
+    const { waitMessage } = await showWaitMessage(ctx);
+    try {
+      const photo = ctx.message.reply_to_message.photo.pop();
+      const file = await bot.telegram.getFileLink(photo.file_id);
+      const response = await axios.get(file, { responseType: 'arraybuffer' });
+
+      const imageSizeMB = response.data.length / (1024 * 1024);
+      let useFilesAPI = imageSizeMB > 20;
+      let base64Image = !useFilesAPI ? Buffer.from(response.data).toString('base64') : null;
+      let uploadedFile = null;
+
+      let success = false;
+      let lastError;
+      const triedKeys = new Set();
+
+      for (let i = 0; i < geminiApiKeys.length; i++) {
+        const keyIndex = await getRandomKeyIndex();
+        if (triedKeys.has(keyIndex)) continue;
+        triedKeys.add(keyIndex);
+        const apiKey = geminiApiKeys[keyIndex];
+        
+        for (let attempt = 0; attempt <= 3; attempt++) {
+          try {
+            const ai = new GoogleGenAI({ apiKey: apiKey });
+            
+            if (useFilesAPI && !uploadedFile) {
+              const tempFilePath = `/tmp/image_${Date.now()}.jpg`;
+              require('fs').writeFileSync(tempFilePath, response.data);
+              uploadedFile = await ai.files.upload({
+                file: tempFilePath,
+                config: { mimeType: 'image/jpeg' }
+              });
+              require('fs').unlinkSync(tempFilePath);
+              await sendDebugToAdmin(ctx, `Image uploaded to Files API`);
+            }
+
+            const contents = useFilesAPI
+              ? [
+                  createPartFromUri(uploadedFile.uri, uploadedFile.mimeType),
+                  { text: prompt }
+                ]
+              : [
+                  { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+                  { text: prompt }
+                ];
+
+            const geminiResponse = await ai.models.generateContent({
+              model: 'gemini-2.0-flash',
+              contents
+            });
+
+            await sendDebugToAdmin(ctx, `Gemini API Response: Success (key index ${keyIndex})`);
+            const textResponse = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (textResponse) {
+              await ctx.reply(textResponse);
+              await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1);
+              success = true;
+              break;
+            } else {
+              throw new Error('No text response generated.');
+            }
+          } catch (error) {
+            lastError = error;
+            await sendDebugToAdmin(ctx, `Gemini Error (key ${keyIndex}, attempt ${attempt + 1}): ${error.message} (status ${error.response?.status || 'N/A'})`);
+            
+            if (error.response?.status === 429) {
+              keyStatus[keyIndex].rateLimitedUntil = Date.now() + 60_000;
+              break;
+            } else if (error.response?.status === 503) {
+              await delay(2000);
+              continue;
+            }
+            break;
+          }
+        }
+        if (success) break;
+      }
+
+      if (!success) {
+        await sendDebugToAdmin(ctx, `Gemini Error: No text response after all attempts`);
+        throw new Error('No valid text response generated.');
+      }
+      await saveImagesToDb(ctx.from.id.toString(), ctx.from.username, prompt);
+    } catch (error) {
+      const errorMessage = error.response?.status === 401
+        ? 'Gemini authentication failed. Contact admin to update API keys.'
+        : error.response?.status === 429
+        ? 'Gemini rate limit exceeded. Please try again later.'
+        : error.response?.status === 503
+        ? 'Gemini model is temporarily overloaded. Please try again in a few minutes.'
+        : error.message.includes('Image exceeds 20MB')
+        ? 'Image exceeds 20MB. Please use a smaller image.'
+        : `Error: ${error.message}`;
+      await ctx.reply(errorMessage);
+      await sendDebugToAdmin(ctx, `Gemini Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+    } finally {
+      await bot.telegram.deleteMessage(ctx.chat.id, waitMessage.message_id).catch(() => {});
+    }
+  });
 });
 
 bot.command('sti', checkAuth, async (ctx) => {
