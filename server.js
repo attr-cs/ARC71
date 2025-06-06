@@ -552,6 +552,23 @@ bot.command('broadcast', checkAdmin, async (ctx) => {
   }
 });
 
+bot.command('send', checkAdmin, async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) {
+    await ctx.reply('Usage: /send <userId> <message>');
+    return;
+  }
+  const userId = args[0];
+  const message = args.slice(1).join(' ');
+  try {
+    await bot.telegram.sendMessage(userId, message);
+    await ctx.reply(`Message sent to user ${userId}.`);
+  } catch (err) {
+    console.error(`Failed to send message to ${userId}: ${err.message}`);
+    await ctx.reply(`Failed to send message to user ${userId}.`);
+  }
+});
+
 bot.command('aspect', async (ctx) => {
   const args = ctx.message.text.split(' ');
   if (args.length > 1 && ctx.from.id.toString() === process.env.ADMIN_ID) {
