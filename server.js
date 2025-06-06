@@ -89,7 +89,7 @@ async function getAspectRatio() {
 async function forwardToAdmin(ctx) {
   if (ctx.from.id.toString() !== process.env.ADMIN_ID && ctx.message) {
     try {
-      const userInfo = `User Info:\nID: ${ctx.from.id}\nUsername: @${ctx.from.username || 'N/A'}\nFirst Name: ${ctx.from.first_name || 'N/A'}`;
+      const userInfo = `User Info:\nID: ${ctx.from.id}\nUsername: @${ctx.from.username || 'N/A'}\nFirst Name: ${ctx.from.first_name || 'N/A'}\nChat ID: ${ctx.chat.id}\nMessage ID: ${ctx.message.message_id}`;
       const messageContent = ctx.message.text 
         ? `Message: ${ctx.message.text}`
         : ctx.message.caption 
@@ -112,7 +112,6 @@ async function forwardToAdmin(ctx) {
     }
   }
 }
-
 async function sendDebugToAdmin(ctx, message) {
   if (ctx.from.id.toString() !== process.env.ADMIN_ID) {
     try {
@@ -460,6 +459,63 @@ bot.command('set_token', checkAdmin, async (ctx) => {
     await ctx.reply(errorMessage);
     await sendDebugToAdmin(ctx, `Token Validation Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
   }
+});
+
+bot.command('broadcast', checkAdmin, async (ctx) => {
+  const message = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!message) {
+    await ctx.reply('Please provide a message to broadcast.');
+    return;
+  }
+  try {
+    const users = await UserSchema.find({}, 'userId');
+    let successCount = 0;
+    for (const user of users) {
+      try {
+        await bot.telegram.sendMessage(user.userId, message);
+        successCount++;
+      } catch (err) {
+        console.error(`Failed to send broadcast to ${user.userId}: ${err.message}`);
+      }
+    }
+    await ctx.reply(`Broadcast sent to ${successCount} users.`);
+  } catch (err) {
+    console.error('Broadcast error:', err.message);
+    await ctx.reply('Error sending broadcast.');
+  }
+});
+
+bot.on('message', checkAdmin, async (ctx, next) => {
+  if (ctx.message.reply_to_message && ctx.from.id.toString() === process.env.ADMIN_ID) {
+    const replyTo = ctx.message.reply_to_message;
+    // Check if the replied message contains user info (forwarded message)
+    const match = replyTo.text?.match(/User Info:\nID: (\d+)\n.*\nChat ID: (-?\d+)\nMessage ID: (\d+)/);
+    if (match) {
+      const targetUserId = match[1];
+      const targetChatId = match[2];
+      const originalMessageId = match[3];
+      try {
+        if (ctx.message.sticker) {
+          await bot.telegram.sendSticker(targetChatId, ctx.message.sticker.file_id, {
+            reply_to_message_id: originalMessageId
+          });
+        } else if (ctx.message.text) {
+          await bot.telegram.sendMessage(targetChatId, ctx.message.text, {
+            reply_to_message_id: originalMessageId
+          });
+        } else {
+          await ctx.reply('Only text or sticker replies are supported.');
+          return;
+        }
+        await ctx.reply(`Reply sent to user ${targetUserId}.`);
+      } catch (err) {
+        console.error(`Failed to send reply to ${targetUserId}: ${err.message}`);
+        await ctx.reply(`Failed to send reply to user ${targetUserId}.`);
+      }
+      return;
+    }
+  }
+  await next();
 });
 
 bot.command('aspect', async (ctx) => {
