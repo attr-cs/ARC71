@@ -442,8 +442,24 @@ bot.command('set_token', checkAdmin, async (ctx) => {
     await ctx.reply('Please provide a token.');
     return;
   }
-  imageToken = token;
-  await ctx.reply('Image token updated.');
+  try {
+    const response = await axios.get(`https://oauth2.googleapis.com/tokeninfo?access_token=${token}`);
+    if (response.data?.exp) {
+      const expiryTimestamp = parseInt(response.data.exp, 10) * 1000; // Convert seconds to milliseconds
+      const expiryDate = new Date(expiryTimestamp);
+      const expiryDateFormatted = expiryDate.toLocaleString(); // Use default time zone
+      imageToken = token;
+      await ctx.reply(`Image token updated. Expires: ${expiryDateFormatted}`);
+    } else {
+      await ctx.reply('Invalid token: No expiry information found.');
+    }
+  } catch (error) {
+    const errorMessage = error.response?.status === 400
+      ? 'Invalid token: Token is expired or malformed.'
+      : `Error validating token: ${error.message}`;
+    await ctx.reply(errorMessage);
+    await sendDebugToAdmin(ctx, `Token Validation Error: ${error.message} (status ${error.response?.status || 'N/A'})`);
+  }
 });
 
 bot.command('aspect', async (ctx) => {
