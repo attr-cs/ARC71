@@ -934,7 +934,7 @@ bot.command('ic', checkAuth, async (ctx) => {
           const textResponse = response.data?.[0]?.content?.data?.[0]?.text;
           if (textResponse) {
             await ctx.reply(textResponse);
-            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1');
+            await updateUserStats(ctx.from.id.toString(), ctx.from.first_name, ctx.from.username, 0, 1);
             success = true;
             break;
           } else {
