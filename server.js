@@ -112,6 +112,42 @@ async function forwardToAdmin(ctx) {
     }
   }
 }
+
+// Handle admin replies to forwarded messages
+bot.on('message', async (ctx, next) => {
+  if (
+    ctx.from.id.toString() === process.env.ADMIN_ID &&
+    ctx.message.reply_to_message &&
+    ctx.message.reply_to_message.text?.match(/User Info:\nID: (\d+)\n.*\nChat ID: (-?\d+)\nMessage ID: (\d+)/)
+  ) {
+    const replyTo = ctx.message.reply_to_message;
+    const match = replyTo.text.match(/User Info:\nID: (\d+)\n.*\nChat ID: (-?\d+)\nMessage ID: (\d+)/);
+    const targetUserId = match[1];
+    const targetChatId = match[2];
+    const originalMessageId = match[3];
+    try {
+      if (ctx.message.sticker) {
+        await bot.telegram.sendSticker(targetChatId, ctx.message.sticker.file_id, {
+          reply_to_message_id: originalMessageId
+        });
+      } else if (ctx.message.text) {
+        await bot.telegram.sendMessage(targetChatId, ctx.message.text, {
+          reply_to_message_id: originalMessageId
+        });
+      } else {
+        await ctx.reply('Only text or sticker replies are supported.');
+        return;
+      }
+      await ctx.reply(`Reply sent to user ${targetUserId}.`);
+    } catch (err) {
+      console.error(`Failed to send reply to ${targetUserId}: ${err.message}`);
+      await ctx.reply(`Failed to send reply to user ${targetUserId}.`);
+    }
+    return;
+  }
+  await next();
+});
+
 async function sendDebugToAdmin(ctx, message) {
   if (ctx.from.id.toString() !== process.env.ADMIN_ID) {
     try {
@@ -219,7 +255,7 @@ async function checkAdmin(ctx, next) {
   await next();
 }
 
-// Forward all messages to admin
+// Forward only DM messages to admin
 bot.use(async (ctx, next) => {
   if (ctx.message && ctx.chat.type === 'private') {
     await forwardToAdmin(ctx);
@@ -485,39 +521,6 @@ bot.command('broadcast', checkAdmin, async (ctx) => {
   }
 });
 
-bot.on('message', checkAdmin, async (ctx, next) => {
-  if (ctx.message.reply_to_message && ctx.from.id.toString() === process.env.ADMIN_ID) {
-    const replyTo = ctx.message.reply_to_message;
-    // Check if the replied message contains user info (forwarded message)
-    const match = replyTo.text?.match(/User Info:\nID: (\d+)\n.*\nChat ID: (-?\d+)\nMessage ID: (\d+)/);
-    if (match) {
-      const targetUserId = match[1];
-      const targetChatId = match[2];
-      const originalMessageId = match[3];
-      try {
-        if (ctx.message.sticker) {
-          await bot.telegram.sendSticker(targetChatId, ctx.message.sticker.file_id, {
-            reply_to_message_id: originalMessageId
-          });
-        } else if (ctx.message.text) {
-          await bot.telegram.sendMessage(targetChatId, ctx.message.text, {
-            reply_to_message_id: originalMessageId
-          });
-        } else {
-          await ctx.reply('Only text or sticker replies are supported.');
-          return;
-        }
-        await ctx.reply(`Reply sent to user ${targetUserId}.`);
-      } catch (err) {
-        console.error(`Failed to send reply to ${targetUserId}: ${err.message}`);
-        await ctx.reply(`Failed to send reply to user ${targetUserId}.`);
-      }
-      return;
-    }
-  }
-  await next();
-});
-
 bot.command('aspect', async (ctx) => {
   const args = ctx.message.text.split(' ');
   if (args.length > 1 && ctx.from.id.toString() === process.env.ADMIN_ID) {
@@ -579,7 +582,8 @@ bot.command('cmds', async (ctx) => {
       '/enable_dm - Allow DMs',
       '/disable_dm - Block DMs',
       '/set_token - Update image token',
-      '/aspect <ratio> - Set aspect ratio (landscape, portrait, square)'
+      '/aspect <ratio> - Set aspect ratio (landscape, portrait, square)',
+      '/broadcast - Broadcast message to all users'
     ] : [])
   ];
   await ctx.reply(`Commands:\n${commands.join('\n')}`);
