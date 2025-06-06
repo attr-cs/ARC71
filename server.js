@@ -79,7 +79,7 @@ async function processQueue() {
 
 function enqueueCommand(ctx, handler) {
   return new Promise(async (resolve) => {
-    const waitMessage = await ctx.reply('Your command is queued. Please wait...', {
+    const waitMessage = await ctx.reply('queued...', {
       disable_web_page_preview: true,
       disable_notification: true
     });
